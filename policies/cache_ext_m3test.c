@@ -2,32 +2,27 @@
 #include <bpf/bpf.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include "dir_watcher.h"
-#include "cache_ext_s3fifo.skel.h"
+#include "cache_ext_m3test.skel.h"
 
-char *USAGE = "Usage: ./cache_ext_s3fifo --watch_dir <dir> --cgroup_size <size> --cgroup_path <path>\n";
+char *USAGE = "Usage: ./cache_ext_m3test --watch_dir <dir> --cgroup_path <path>\n";
 struct cmdline_args {
 	char *watch_dir;
-        uint64_t cgroup_size;
-        char *cgroup_path;
+	char *cgroup_path;
 };
 
 static struct argp_option options[] = {
 	{ "watch_dir", 'w', "DIR", 0, "Directory to watch" },
-        {"cgroup_size", 's', "SIZE", 0, "Size of the cgroup"},
-        {"cgroup_path", 'c', "PATH", 0, "Path to cgroup (e.g., /sys/fs/cgroup/cache_ext_test)"},
+	{ "cgroup_path", 'c', "PATH", 0, "Path to cgroup (e.g., /sys/fs/cgroup/cache_ext_test)" },
 	{ 0 },
 };
-
-static const uint64_t page_size = 4096;
 
 static volatile sig_atomic_t exiting;
 
@@ -42,17 +37,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 	case 'w':
 		args->watch_dir = arg;
 		break;
-        case 's':
-                // TODO: move this to parse_args()
-                errno = 0;
-                args->cgroup_size = strtoull(arg, NULL, 10);
-                if (errno)
-                        args->cgroup_size = 0;
-
-                break;
-        case 'c':
-                args->cgroup_path = arg;
-                break;
+	case 'c':
+		args->cgroup_path = arg;
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -66,11 +53,6 @@ static int parse_args(int argc, char **argv, struct cmdline_args *args) {
 	if (args->watch_dir == NULL) {
 		fprintf(stderr, "Missing required argument: watch_dir\n");
 		return 1;
-	}
-
-	if (args->cgroup_size == 0) {
-	        fprintf(stderr, "Invalid cgroup size\n");
-	        return 1;
 	}
 
 	if (args->cgroup_path == NULL) {
@@ -110,7 +92,7 @@ static int validate_watch_dir(const char *watch_dir, char *watch_dir_full_path) 
 
 int main(int argc, char **argv) {
 	struct cmdline_args args = { 0 };
-	struct cache_ext_s3fifo_bpf *skel = NULL;
+	struct cache_ext_m3test_bpf *skel = NULL;
 	struct bpf_link *link = NULL;
 	struct sigaction sa;
 	char watch_dir_path[PATH_MAX];
@@ -135,69 +117,40 @@ int main(int argc, char **argv) {
 	if (validate_watch_dir(args.watch_dir, watch_dir_path))
 		return 1;
 
-	// Open cgroup directory early
 	cgroup_fd = open(args.cgroup_path, O_RDONLY);
 	if (cgroup_fd < 0) {
 		perror("Failed to open cgroup path");
 		return 1;
 	}
 
-	skel = cache_ext_s3fifo_bpf__open();
+	skel = cache_ext_m3test_bpf__open();
 	if (!skel) {
 		perror("Failed to open BPF skeleton");
 		goto cleanup;
 	}
 
-	// Set cache size in terms of number of pages. Assumes uniform page size.
-	skel->rodata->cache_size = args.cgroup_size / page_size;
-	fprintf(stderr, "Cgroup size: %lu bytes\n", args.cgroup_size);
-	fprintf(stderr, "Cache size: %lu pages\n", skel->rodata->cache_size);
-
-	// ghost_map is resized to cache_size below; a zero size makes the LRU map
-	// creation fail with a cryptic -EINVAL, so reject a too-small --cgroup_size
-	// up front with a clear message.
-	if (skel->rodata->cache_size == 0) {
-		fprintf(stderr,
-			"--cgroup_size %lu is smaller than the page size (%ld); "
-			"cache_size would be 0 pages. Pass a larger --cgroup_size.\n",
-			args.cgroup_size, page_size);
-		goto cleanup;
-	}
-
-	// Resize ghost_map
-	if (bpf_map__set_max_entries(skel->maps.ghost_map, skel->rodata->cache_size)) {
-		perror("Failed to resize ghost_map");
-		ret = 1;
-		goto cleanup;
-	}
-
-	// Set watch_dir
 	watch_dir_path_len_map(skel) = strlen(watch_dir_path);
 	strcpy(watch_dir_path_map(skel), watch_dir_path);
 
-	if (cache_ext_s3fifo_bpf__load(skel)) {
+	if (cache_ext_m3test_bpf__load(skel)) {
 		perror("Failed to load BPF skeleton");
-		ret = 1;
 		goto cleanup;
 	}
 
 	if (initialize_watch_dir_map(watch_dir_path, bpf_map__fd(inode_watchlist_map(skel)), true)) {
 		perror("Failed to initialize watch_dir map");
-		ret = 1;
 		goto cleanup;
 	}
 
-	link = bpf_map__attach_cache_ext_ops(skel->maps.s3fifo_ops, cgroup_fd);
+	link = bpf_map__attach_cache_ext_ops(skel->maps.m3test_ops, cgroup_fd);
 	if (link == NULL) {
 		perror("Failed to attach cache_ext_ops to cgroup");
-		ret = 1;
 		goto cleanup;
 	}
 
 	// This is necessary for the dir_watcher functionality
-	if (cache_ext_s3fifo_bpf__attach(skel)) {
+	if (cache_ext_m3test_bpf__attach(skel)) {
 		perror("Failed to attach BPF skeleton");
-		ret = 1;
 		goto cleanup;
 	}
 
@@ -209,6 +162,6 @@ int main(int argc, char **argv) {
 cleanup:
 	close(cgroup_fd);
 	bpf_link__destroy(link);
-	cache_ext_s3fifo_bpf__destroy(skel);
+	cache_ext_m3test_bpf__destroy(skel);
 	return ret;
 }

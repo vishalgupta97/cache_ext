@@ -124,9 +124,14 @@ generic_test_bit(unsigned long nr, const volatile unsigned long *addr)
 
 static inline unsigned long *folio_flags(struct folio *folio, unsigned n)
 {
-	struct page *page = &folio->page;
-	/* v7.0: page->flags is memdesc_flags_t { unsigned long f; } */
-	return &page[n].flags.f;
+	/*
+	 * Verifier-checked typed access: struct_ops hook folios (and node->folio
+	 * walked from a trusted cache_ext_list_node) are PTR_TRUSTED, so we read
+	 * the folio's own flags field directly instead of poking through the
+	 * transitional folio->page union. n is always 0 for our callers (the
+	 * head page); v7.0: flags is memdesc_flags_t { unsigned long f; }.
+	 */
+	return &folio->flags.f;
 }
 
 
