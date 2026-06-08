@@ -3,8 +3,8 @@
 CLANG ?= clang-14
 BPFTOOL ?= /usr/local/sbin/bpftool #../../tools/bpf/bpftool/bpftool
 CFLAGS = -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -c -g -Wall
-USERSPACE_CFLAGS = -O2 -fsanitize=address -g -Wall
-USERSPACE_LINKER_FLAGS = -L/usr/local/lib64 -lbpf
+USERSPACE_CFLAGS = -O2 -fsanitize=address -g -Wall -I/usr/local/include
+USERSPACE_LINKER_FLAGS = -L/usr/local/lib64 -lbpf -Wl,-rpath,/usr/local/lib64
 
 # Define the BPF program source and the output object file
 BPF_SRC = cache_ext_simple.bpf.c cache_ext_mru.bpf.c cache_ext_mglru.bpf.c
@@ -40,6 +40,9 @@ all: 	cache_ext_mru.out cache_ext_mglru.out cache_ext_fifo.out \
 
 $(VMLINUX_H):
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX_H)
+	# Drop kfunc prototypes that the installed libbpf bpf_helpers.h also
+	# declares (with a different signature), which would otherwise conflict.
+	sed -i '/^extern int bpf_stream_vprintk(/d' $(VMLINUX_H)
 
 .SECONDARY:
 %.bpf.o: %.bpf.c $(VMLINUX_H) dir_watcher.bpf.h

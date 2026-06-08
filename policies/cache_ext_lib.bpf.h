@@ -125,7 +125,8 @@ generic_test_bit(unsigned long nr, const volatile unsigned long *addr)
 static inline unsigned long *folio_flags(struct folio *folio, unsigned n)
 {
 	struct page *page = &folio->page;
-	return &page[n].flags;
+	/* v7.0: page->flags is memdesc_flags_t { unsigned long f; } */
+	return &page[n].flags.f;
 }
 
 
@@ -186,8 +187,8 @@ static inline bool folio_test_locked(struct folio *folio)
 
 static inline bool folio_test_hugetlb(struct folio *folio)
 {
-	return folio_test_large(folio) &&
-		generic_test_bit(PG_hugetlb, folio_flags(folio, 1));
+	/* v7.0: hugetlb is a page type (PGTY_hugetlb) in page_type, not PG_hugetlb */
+	return (folio->page.page_type >> 24) == PGTY_hugetlb;
 }
 
 static inline bool folio_test_unevictable(struct folio *folio)
