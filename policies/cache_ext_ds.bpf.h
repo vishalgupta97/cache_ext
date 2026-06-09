@@ -150,26 +150,65 @@ cache_ext_bpf_list_add_tail(struct cache_ext_list *list,
 	head->prev = new;
 }
 
-/* Count nodes in the list (walk head->next until back to head). Bounded. */
-#define CACHE_EXT_LIST_MAX_WALK 8192
+/*
+ * Standard list_del_init: unlink node from its list and re-init its links to
+ * itself (so a subsequent add works and a double-del is harmless).
+ */
+static __always_inline void
+cache_ext_bpf_list_del(struct cache_ext_list_node *node)
+{
+	struct list_head *n = &node->node;
+	struct list_head *prev = n->prev;   /* MEM_WRITE via propagation */
+	struct list_head *next = n->next;
+
+	prev->next = next;
+	next->prev = prev;
+	n->next = n;
+	n->prev = n;
+}
+
+/*
+ * Iterate / count the list. Implemented with bpf_loop (a constant-bound for
+ * loop is unrolled by clang -> -E2BIG) walking raw addresses with
+ * bpf_probe_read_kernel (typed kernel pointers lose their BTF type when carried
+ * through a bpf_loop callback ctx, and the walk is read-only so MEM_WRITE is
+ * unneeded). list_head.next is at offset 0.
+ */
+#define CACHE_EXT_LIST_MAX_WALK (1u << 23)
+
+struct cache_ext_walk_ctx {
+	__u64 head;   /* &list->head */
+	__u64 cur;    /* current list_head address */
+	__u64 count;
+};
+
+static int cache_ext_list_walk_cb(__u32 i, void *vctx)
+{
+	struct cache_ext_walk_ctx *c = vctx;
+	__u64 next = 0;
+
+	if (c->cur == 0 || c->cur == c->head)
+		return 1; /* stop */
+	c->count++;
+	if (bpf_probe_read_kernel(&next, sizeof(next), (void *)c->cur))
+		return 1;
+	c->cur = next;
+	return 0;
+}
+
 static __always_inline __u64
 cache_ext_bpf_list_count(struct cache_ext_list *list)
 {
-	struct list_head *head = &list->head;
-	struct list_head *cur = head->next;
-	__u64 n = 0;
-	int i;
+	struct cache_ext_walk_ctx c = {};
+	__u64 first = 0;
 
-	/* Real bounded loop, not unrolled (8192 iterations unrolled blow up the
-	 * program size to -E2BIG). */
-#pragma clang loop unroll(disable)
-	for (i = 0; i < CACHE_EXT_LIST_MAX_WALK; i++) {
-		if (!cur || cur == head)
-			break;
-		n++;
-		cur = cur->next;
-	}
-	return n;
+	c.head = cache_ext_ptr_to_u64(&list->head);
+	/* first = list->head.next */
+	if (bpf_probe_read_kernel(&first, sizeof(first), (void *)c.head))
+		return 0;
+	c.cur = first;
+	bpf_loop(CACHE_EXT_LIST_MAX_WALK, cache_ext_list_walk_cb, &c, 0);
+	return c.count;
 }
 
 #endif /* _CACHE_EXT_DS_BPF_H */

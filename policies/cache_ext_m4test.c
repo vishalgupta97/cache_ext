@@ -89,13 +89,13 @@ int main(int argc, char **argv) {
 
 	printf("Attached. Polling BPF valid_folios_lookup counters (Ctrl-C to exit)...\n");
 	while (!exiting) {
-		printf("lookup: total=%llu found=%llu match=%llu miss=%llu | list: adds=%llu count=%llu\n",
-		       (unsigned long long)skel->bss->lookup_total,
+		printf("lookup: found=%llu match=%llu miss=%llu | list: adds=%llu dels=%llu live=%lld\n",
 		       (unsigned long long)skel->bss->lookup_found,
 		       (unsigned long long)skel->bss->lookup_match,
 		       (unsigned long long)skel->bss->lookup_miss,
 		       (unsigned long long)skel->bss->list_adds,
-		       (unsigned long long)skel->bss->list_count);
+		       (unsigned long long)skel->bss->list_dels,
+		       (long long)skel->bss->list_adds - (long long)skel->bss->list_dels);
 		fflush(stdout);
 		sleep(1);
 	}
