@@ -36,6 +36,8 @@ __u64 lookup_miss;
 __u64 main_list;      /* (u64)cache_ext_list * */
 __u64 list_adds;
 __u64 list_dels;
+__u64 evict_calls;    /* evict_folios invocations */
+__u64 evict_victims;  /* folios offered for eviction */
 
 /* Lock protecting the BPF list operations. */
 struct ce_lock {
@@ -98,6 +100,61 @@ void BPF_STRUCT_OPS(m4test_folio_added, struct folio *folio,
 	__sync_fetch_and_add(&list_adds, 1);
 }
 
+/*
+ * Pure-BPF FIFO eviction: walk main_list from the head (oldest first) and hand
+ * the kernel up to request_nr_folios_to_evict victims. The whole walk runs under
+ * the bpf_spin_lock so concurrent folio_added/evicted cannot free a node mid-walk
+ * (-> no use-after-free / garbage folio offered to the kernel). The list is
+ * traversed with bpf_probe_read_kernel (allowed under bpf_spin_lock; it is not a
+ * sleepable helper) over raw addresses:
+ *   cache_ext_list.head      @ 0  -> &list->head == main_list
+ *   list_head.next           @ 0
+ *   cache_ext_list_node.node @ 8  -> node = list_head_addr - 8
+ *   cache_ext_list_node.folio@ 0
+ * The loop is unrolled (bound 32 = folios_to_evict size) so the array index is a
+ * compile-time constant (a variable index into the ctx BTF struct is rejected).
+ * No evictability filtering -- pure FIFO; the kernel skips folios it can't reclaim.
+ */
+#define CACHE_EXT_EVICT_MAX 32
+
+void BPF_STRUCT_OPS(m4test_evict_folios, struct cache_ext_eviction_ctx *ectx,
+		    struct mem_cgroup *memcg)
+{
+	struct ce_lock *l;
+	__u64 head_addr, cur = 0;
+	unsigned long req, k = 0;
+	int i;
+
+	__sync_fetch_and_add(&evict_calls, 1);  /* count entry, before any bail-out */
+	if (!main_list)
+		return;
+	l = ce_get_lock();
+	if (!l)
+		return;
+
+	req = ectx->request_nr_folios_to_evict;
+	head_addr = main_list; /* &list->head (head is at offset 0) */
+
+	bpf_spin_lock(&l->lock);
+	bpf_probe_read_kernel(&cur, sizeof(cur), (void *)head_addr); /* head.next */
+	for (i = 0; i < CACHE_EXT_EVICT_MAX; i++) {
+		__u64 node_addr, folio = 0;
+
+		if (cur == 0 || cur == head_addr)
+			break;
+		if ((unsigned long)i >= req)
+			break;
+		node_addr = cur - 8; /* container_of(cur, cache_ext_list_node, node) */
+		bpf_probe_read_kernel(&folio, sizeof(folio), (void *)node_addr);
+		ectx->folios_to_evict[i] = (struct folio *)folio; /* const index i */
+		k++;
+		bpf_probe_read_kernel(&cur, sizeof(cur), (void *)cur); /* next */
+	}
+	ectx->nr_folios_to_evict = k;
+	bpf_spin_unlock(&l->lock);
+	__sync_fetch_and_add(&evict_victims, k);
+}
+
 void BPF_STRUCT_OPS(m4test_folio_evicted, struct folio *folio,
 		    mem_cgroup_per_node_bpf_writable *pn)
 {
@@ -126,6 +183,7 @@ void BPF_STRUCT_OPS(m4test_folio_evicted, struct folio *folio,
 SEC(".struct_ops.link")
 struct cache_ext_ops m4test_ops = {
 	.init = (void *)m4test_init,
+	.evict_folios = (void *)m4test_evict_folios,
 	.folio_added = (void *)m4test_folio_added,
 	.folio_evicted = (void *)m4test_folio_evicted,
 };
