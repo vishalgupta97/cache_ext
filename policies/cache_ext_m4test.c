@@ -87,8 +87,18 @@ int main(int argc, char **argv) {
 		goto cleanup;
 	}
 
-	printf("Press any key to exit...\n");
-	getchar();
+	printf("Attached. Polling BPF valid_folios_lookup counters (Ctrl-C to exit)...\n");
+	while (!exiting) {
+		printf("lookup: total=%llu found=%llu match=%llu miss=%llu | list: adds=%llu count=%llu\n",
+		       (unsigned long long)skel->bss->lookup_total,
+		       (unsigned long long)skel->bss->lookup_found,
+		       (unsigned long long)skel->bss->lookup_match,
+		       (unsigned long long)skel->bss->lookup_miss,
+		       (unsigned long long)skel->bss->list_adds,
+		       (unsigned long long)skel->bss->list_count);
+		fflush(stdout);
+		sleep(1);
+	}
 	ret = 0;
 
 cleanup:
