@@ -1,37 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Sampling (LFU-ish) eviction policy -- PURE BPF data structures (M4).
+ *
+ * List maintenance is pure BPF over the kernel-resident nodes (folio_added
+ * appends, folio_evicted unlinks before the kernel frees the node). The only
+ * kfunc is new_list. evict_folios reimplements the kernel `sample` op in BPF:
+ * walk the head of the list, score each folio (LFU: access count, plus
+ * non-evictable folios get INT64_MAX), and for each group of sample_size folios
+ * evict the lowest-scoring one.
+ *
+ * The walk is a racy bpf_loop walk over raw addresses (bpf_probe_read_kernel) --
+ * NOT under the bpf_spin_lock, because bpf_loop is not allowed inside a
+ * spin-lock CS. Safety: a folio that has been (or is being) evicted has its
+ * metadata deleted FIRST in folio_evicted, and its node unlinked, so the walk
+ * only reaches live folios; any stale/freed node has no metadata and scores
+ * INT64_MAX, so it is never offered to the kernel. evict_folios is only invoked
+ * under real LRU reclaim (MGLRU off, working-set workload), not streaming reads.
+ */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
 #include "cache_ext_lib.bpf.h"
+#include "cache_ext_ds.bpf.h"
 #include "dir_watcher.bpf.h"
 
 char _license[] SEC("license") = "GPL";
 
-#define BPF_STRUCT_OPS(name, args...) \
-	SEC("struct_ops/" #name)      \
-	BPF_PROG(name, ##args)
-
-#define BPF_STRUCT_OPS_SLEEPABLE(name, args...) \
-	SEC("struct_ops.s/" #name)              \
-	BPF_PROG(name, ##args)
-
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-
-#define INT64_MAX  (9223372036854775807LL)
-
-// #define DEBUG
-#ifdef DEBUG
-#define dbg_printk(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
-#else
-#define dbg_printk(fmt, ...)
-#endif
-
-/*
- * Maps
- */
-
-#define MAX_PAGES (1 << 20)
+#define INT64_MAX (9223372036854775807LL)
+#define SAMPLE_SIZE 20
+#define EVICT_MAX 32
 
 struct folio_metadata {
 	u64 accesses;
@@ -44,222 +43,181 @@ struct {
 	__uint(max_entries, 4000000);
 } folio_metadata_map SEC(".maps");
 
+/* per-CPU per-group running minimum used while sampling. */
+struct sample_min {
+	__u64 folio;
+	__s64 score;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, EVICT_MAX);
+	__type(key, __u32);
+	__type(value, struct sample_min);
+} sample_results SEC(".maps");
+
 __u64 sampling_list;
 
-#define MAX_STAT_NAME_LEN 256
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, char[MAX_STAT_NAME_LEN]);
-	__type(value, s64);
-	__uint(max_entries, 256);
-} stats SEC(".maps");
-
-/* App type for specific optimizations */
-enum App {
-	GENERIC_APP,
-	LEVELDB,
-};
-
-// Keys for stats
-char STAT_SCAN_PAGES[MAX_STAT_NAME_LEN] = "scan_pages";
-char STAT_TOTAL_PAGES[MAX_STAT_NAME_LEN] = "total_pages";
-char STAT_EVICTED_SCAN_PAGES[MAX_STAT_NAME_LEN] = "evicted_scan_pages";
-char STAT_EVICTED_TOTAL_PAGES[MAX_STAT_NAME_LEN] = "evicted_total_pages";
-
-/* Counter for list size */
-const int APP_TYPE = GENERIC_APP;
-
-inline void update_stat(char (*stat_name)[MAX_STAT_NAME_LEN], s64 delta) {
-#ifdef DEBUG
-	u64 *counter = bpf_map_lookup_elem(&stats, stat_name);
-	if (!counter) {
-		u64 zero = 0;
-		bpf_map_update_elem(&stats, stat_name, &zero, BPF_NOEXIST);
-		counter = bpf_map_lookup_elem(&stats, stat_name);
-	}
-	if (counter) {
-		__sync_fetch_and_add(counter, delta);
-	}
-#endif // DEBUG
-}
-
-inline bool is_folio_relevant(struct folio *folio)
+static inline bool is_folio_relevant(struct folio *folio)
 {
-	if (!folio) {
-		// bpf_printk("folio not relevant because it's null\n");
+	if (!folio || !folio->mapping || !folio->mapping->host)
 		return false;
-	}
-	if (folio->mapping == NULL) {
-		// bpf_printk("folio not relevant because it's mapping is null\n");
-		return false;
-	}
-	if (folio->mapping->host == NULL) {
-		// bpf_printk("folio not relevant because it's host is null\n");
-		return false;
-	}
-	bool res = inode_in_watchlist(folio->mapping->host->i_ino);
-	// if (!res) {
-	// 	bpf_printk("folio not relevant because it's inode is not in watchlist, inode %llu\n",
-	// 		   folio->mapping->host->i_ino);
-
-	// }
-	return res;
+	return inode_in_watchlist(folio->mapping->host->i_ino);
 }
 
-// SEC("struct_ops.s/sampling_init")
 s32 BPF_STRUCT_OPS_SLEEPABLE(sampling_init, struct mem_cgroup *memcg)
 {
-	dbg_printk("cache_ext: Hi from the sampling_init hook! :D\n");
 	sampling_list = bpf_cache_ext_ds_registry_new_list(memcg);
-	if (sampling_list == 0) {
-		bpf_printk("cache_ext: Failed to create sampling_list\n");
+	if (sampling_list == 0)
 		return -1;
-	}
-	bpf_printk("cache_ext: Created sampling_list: %llu\n",
-		   sampling_list);
 	return 0;
 }
 
-void BPF_STRUCT_OPS(sampling_folio_added, struct folio *folio)
+void BPF_STRUCT_OPS(sampling_folio_added, struct folio *folio,
+		    mem_cgroup_per_node_bpf_writable *pn)
 {
-	dbg_printk(
-		"cache_ext: Hi from the sampling_folio_added hook! :D\n");
-	if (!is_folio_relevant(folio)) {
-		return;
-	}
-
-	int ret = bpf_cache_ext_list_add_tail(sampling_list, folio);
-	if (ret != 0) {
-		bpf_printk(
-			"cache_ext: Failed to add folio to sampling_list\n");
-		return;
-	}
-	dbg_printk("cache_ext: Added folio to sampling_list\n");
-
-	update_stat(&STAT_TOTAL_PAGES, 1);
-
-	// Create folio metadata
 	u64 key = (u64)folio;
 	struct folio_metadata new_meta = { .accesses = 1 };
+
+	if (!is_folio_relevant(folio))
+		return;
+	if (cache_ext_list_add_tail_bpf(pn, folio, sampling_list))
+		return;
 	bpf_map_update_elem(&folio_metadata_map, &key, &new_meta, BPF_ANY);
 }
 
 void BPF_STRUCT_OPS(sampling_folio_accessed, struct folio *folio)
 {
-	if (!is_folio_relevant(folio)) {
-		return;
-	}
-	// TODO: Update folio metadata with other values we want to track
 	struct folio_metadata *meta;
 	u64 key = (u64)folio;
+
+	if (!is_folio_relevant(folio))
+		return;
 	meta = bpf_map_lookup_elem(&folio_metadata_map, &key);
 	if (!meta) {
 		struct folio_metadata new_meta = { 0 };
-		int ret = bpf_map_update_elem(&folio_metadata_map, &key,
-					      &new_meta, BPF_ANY);
-		if (ret != 0) {
-			bpf_printk(
-				"cache_ext: Failed to create folio metadata in accessed. Return value: %d\n",
-				ret);
+
+		if (bpf_map_update_elem(&folio_metadata_map, &key, &new_meta, BPF_ANY))
 			return;
-		}
 		meta = bpf_map_lookup_elem(&folio_metadata_map, &key);
-		if (meta == NULL) {
-			bpf_printk("cache_ext: Failed to get created folio metadata in accessed\n");
+		if (!meta)
 			return;
-		}
 	}
 	__sync_fetch_and_add(&meta->accesses, 1);
 }
 
-void BPF_STRUCT_OPS(sampling_folio_evicted, struct folio *folio)
+void BPF_STRUCT_OPS(sampling_folio_evicted, struct folio *folio,
+		    mem_cgroup_per_node_bpf_writable *pn)
 {
-	dbg_printk(
-		"cache_ext: Hi from the sampling_folio_evicted hook! :D\n");
-	// if (bpf_cache_ext_list_del(folio)) {
-	// 	dbg_printk("cache_ext: Failed to delete folio from sampling_list\n");
-	// 	return;
-	// }
-
 	u64 key = (u64)folio;
+
+	/* Delete metadata FIRST (liveness marker), then unlink the node before
+	 * the kernel frees it. */
 	bpf_map_delete_elem(&folio_metadata_map, &key);
-	update_stat(&STAT_TOTAL_PAGES, -1);
-	update_stat(&STAT_EVICTED_TOTAL_PAGES, 1);
-
+	cache_ext_list_del_bpf(pn, folio);
 }
 
-static inline bool is_last_page_in_file(struct folio *folio)
+/* Page-flag bits we care about (vmlinux enum pageflags). */
+static __always_inline __s64 sampling_score(__u64 folio_addr)
 {
-	struct address_space *mapping = folio->mapping;
-	if (!mapping) {
-		return false;
-	}
-	struct inode *inode = mapping->host;
-	if (!inode) {
-		return false;
-	}
-	// TODO: Handle hugepages
-	if (folio_test_large(folio) ||  folio_test_hugetlb(folio)) {
-		bpf_printk("cache_ext: Hugepages not supported\n");
-		return false;
-	}
-	unsigned long long file_size = i_size_read(inode);
-	unsigned long long page_index = folio_index(folio);
-	unsigned long long page_size = 4096;
-	unsigned long long last_page_index = (file_size + page_size - 1) / page_size - 1;
-	return page_index == last_page_index;
-}
+	struct folio_metadata *meta;
+	__u64 key = folio_addr;
+	__u64 flags = 0;
+	__s64 score;
 
-static s64 bpf_lfu_score_fn(struct cache_ext_list_node *a)
-{
-	s64 score = 0;
-	struct folio_metadata *meta_a;
-	u64 key_a = (u64)a->folio;
-	meta_a = bpf_map_lookup_elem(&folio_metadata_map, &key_a);
-	if (!meta_a) {
-		bpf_printk("cache_ext: Failed to get metadata\n");
+	meta = bpf_map_lookup_elem(&folio_metadata_map, &key);
+	if (!meta)
+		return INT64_MAX; /* not live / already evicted */
+	score = meta->accesses;
+
+	/* folio->flags.f is at offset 0 of struct folio */
+	if (bpf_probe_read_kernel(&flags, sizeof(flags), (void *)folio_addr))
 		return INT64_MAX;
-	}
-	score = meta_a->accesses;
-	if (APP_TYPE == LEVELDB) {
-		// In leveldb, the index block is at the end of the file.
-		bool is_last_page = is_last_page_in_file(a->folio);
-		if (is_last_page) {
-			// bpf_printk("cache_ext: Found last page in file\n");
-			score += 100000;
+	if (!(flags & (1UL << PG_uptodate)) || !(flags & (1UL << PG_lru)))
+		return INT64_MAX;
+	if ((flags & (1UL << PG_dirty)) || (flags & (1UL << PG_writeback)))
+		return INT64_MAX;
+	return score;
+}
+
+struct sample_walk_ctx {
+	__u64 cur;   /* current list_head address */
+	__u64 head;  /* &list->head */
+	__u64 count; /* nodes actually visited */
+};
+
+static int sample_walk_cb(__u32 i, void *vctx)
+{
+	struct sample_walk_ctx *c = vctx;
+	__u64 node_addr, folio = 0, next = 0;
+	__u32 group = i / SAMPLE_SIZE;
+	struct sample_min *res;
+	__s64 score;
+
+	if (c->cur == 0 || c->cur == c->head)
+		return 1; /* end of list */
+	node_addr = c->cur - 8; /* container_of(cur, cache_ext_list_node, node) */
+	if (bpf_probe_read_kernel(&folio, sizeof(folio), (void *)node_addr))
+		return 1;
+	score = sampling_score(folio);
+
+	res = bpf_map_lookup_elem(&sample_results, &group);
+	if (res) {
+		if ((i % SAMPLE_SIZE) == 0 || score < res->score) {
+			res->score = score;
+			res->folio = folio;
 		}
 	}
-
-	if (!folio_test_uptodate(a->folio) || !folio_test_lru(a->folio)) {
-		return INT64_MAX;
-	}
-	if (folio_test_dirty(a->folio) || folio_test_writeback(a->folio)) {
-		return INT64_MAX;
-	}
-	return score;
+	c->count++;
+	/* advance: cur = cur->next (list_head.next @ 0) */
+	if (bpf_probe_read_kernel(&next, sizeof(next), (void *)c->cur))
+		return 1;
+	c->cur = next;
+	return 0;
 }
 
 void BPF_STRUCT_OPS(sampling_evict_folios,
 		    struct cache_ext_eviction_ctx *eviction_ctx,
 		    struct mem_cgroup *memcg)
 {
-	dbg_printk(
-		"cache_ext: Hi from the sampling_evict_folios hook! :D\n");
+	struct sample_walk_ctx c = {};
+	unsigned long req = eviction_ctx->request_nr_folios_to_evict;
+	__u64 num;
+	unsigned long out = 0;
+	int g;
 
-	struct sampling_options sampling_opts = {
-		.sample_size = 20,
-	};
-	bpf_cache_ext_list_sample(memcg, sampling_list, bpf_lfu_score_fn,
-				  &sampling_opts, eviction_ctx);
-	dbg_printk("cache_ext: Evicting %d pages (%d requested)\n",
-			   eviction_ctx->nr_folios_to_evict,
-			   eviction_ctx->request_nr_folios_to_evict);
-	dbg_printk("cache_ext: Printing first two and last two folios: %p %p %p %p\n",
-			   eviction_ctx->folios_to_evict[0],
-			   eviction_ctx->folios_to_evict[1],
-			   eviction_ctx->folios_to_evict[32 - 2],
-			   eviction_ctx->folios_to_evict[32 - 1]);
+	if (!sampling_list)
+		return;
+	if (req > EVICT_MAX)
+		req = EVICT_MAX;
+	num = req * SAMPLE_SIZE;
+
+	c.head = sampling_list; /* &list->head (head @ offset 0) */
+	if (bpf_probe_read_kernel(&c.cur, sizeof(c.cur), (void *)c.head))
+		return;
+
+	bpf_loop(num, sample_walk_cb, &c, 0);
+
+	/* Groups populate 0,1,2,... in order, so the populated groups are exactly
+	 * [0, num_groups) -- contiguous, no gaps. Emit each group's min at its
+	 * constant index (a variable index into the ctx BTF array is rejected).
+	 * A group's min may be INT64_MAX (non-evictable folio); that's harmless --
+	 * the kernel skips folios it cannot reclaim. We never emit a NULL folio. */
+	__u64 num_groups = (c.count + SAMPLE_SIZE - 1) / SAMPLE_SIZE;
+
+	for (g = 0; g < EVICT_MAX; g++) {
+		struct sample_min *res;
+		__u32 key = g;
+
+		if ((unsigned long)g >= req || (__u64)g >= num_groups)
+			break;
+		res = bpf_map_lookup_elem(&sample_results, &key);
+		if (!res || res->folio == 0)
+			break;
+		eviction_ctx->folios_to_evict[g] = (struct folio *)res->folio;
+		eviction_ctx->scores[g] = res->score;
+		out++;
+	}
+	eviction_ctx->nr_folios_to_evict = out;
 }
 
 SEC(".struct_ops.link")
