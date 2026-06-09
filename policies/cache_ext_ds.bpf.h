@@ -150,6 +150,21 @@ cache_ext_bpf_list_add_tail(struct cache_ext_list *list,
 	head->prev = new;
 }
 
+/* Standard list_add: insert node at the head (front) of the list. */
+static __always_inline void
+cache_ext_bpf_list_add(struct cache_ext_list *list,
+		       struct cache_ext_list_node *node)
+{
+	struct list_head *head = &list->head;
+	struct list_head *new = &node->node;
+	struct list_head *next = head->next; /* MEM_WRITE via propagation */
+
+	new->prev = head;
+	new->next = next;
+	next->prev = new;
+	head->next = new;
+}
+
 /*
  * Standard list_del_init: unlink node from its list and re-init its links to
  * itself (so a subsequent add works and a double-del is harmless).
@@ -209,6 +224,186 @@ cache_ext_bpf_list_count(struct cache_ext_list *list)
 	c.cur = first;
 	bpf_loop(CACHE_EXT_LIST_MAX_WALK, cache_ext_list_walk_cb, &c, 0);
 	return c.count;
+}
+
+/******************************************************************************
+ * Policy-facing API: pure-BPF replacements for the cache_ext list kfuncs.
+ *
+ * Each takes the writable parent (pn, from the hook arg) and a list id (the u64
+ * from bpf_cache_ext_ds_registry_new_list). They look up the folio's node, cast
+ * node + list to writable typed pointers, and mutate the kernel-resident list
+ * under a per-policy bpf_spin_lock. The lookup runs OUTSIDE the lock (it loops /
+ * calls helpers); only the inlined linkage runs inside.
+ *
+ * One bpf_spin_lock per policy (this map is instantiated per BPF object). A
+ * single lock serialises all of a policy's lists, which is sufficient and
+ * matches the kernel's single registry rwlock.
+ *****************************************************************************/
+struct cache_ext_lock_val {
+	struct bpf_spin_lock lock;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct cache_ext_lock_val);
+} cache_ext_lock_map SEC(".maps");
+
+static __always_inline struct bpf_spin_lock *cache_ext_lock(void)
+{
+	__u32 k = 0;
+	struct cache_ext_lock_val *v = bpf_map_lookup_elem(&cache_ext_lock_map, &k);
+
+	return v ? &v->lock : NULL;
+}
+
+/*
+ * NOTE: do the writable_cast calls directly into locals in each wrapper -- not
+ * via a shared helper with output-pointer params. Spilling a writable-cast
+ * (PTR_TO_BTF_ID | MEM_WRITE) pointer to the stack through an out-param and
+ * reloading it loses the type ("Rn invalid mem access 'scalar'").
+ */
+
+/* folio -> node, append to tail of list_id. Replaces bpf_cache_ext_list_add_tail. */
+static __always_inline int
+cache_ext_list_add_tail_bpf(mem_cgroup_per_node_bpf_writable *pn,
+			    struct folio *folio, __u64 list_id)
+{
+	struct cache_ext_list_node *node, *wnode;
+	struct cache_ext_list *wlist;
+	struct bpf_spin_lock *lk;
+
+	if (!pn || !list_id)
+		return -1;
+	node = cache_ext_bpf_valid_folios_lookup(pn, folio);
+	if (!node)
+		return -1;
+	wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
+	wlist = cache_ext_writable_cast(list_id, struct cache_ext_list);
+	lk = cache_ext_lock();
+	if (!wnode || !wlist || !lk)
+		return -1;
+	bpf_spin_lock(lk);
+	cache_ext_bpf_list_add_tail(wlist, wnode);
+	bpf_spin_unlock(lk);
+	return 0;
+}
+
+/* folio -> node, insert at head of list_id. Replaces bpf_cache_ext_list_add. */
+static __always_inline int
+cache_ext_list_add_bpf(mem_cgroup_per_node_bpf_writable *pn,
+		       struct folio *folio, __u64 list_id)
+{
+	struct cache_ext_list_node *node, *wnode;
+	struct cache_ext_list *wlist;
+	struct bpf_spin_lock *lk;
+
+	if (!pn || !list_id)
+		return -1;
+	node = cache_ext_bpf_valid_folios_lookup(pn, folio);
+	if (!node)
+		return -1;
+	wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
+	wlist = cache_ext_writable_cast(list_id, struct cache_ext_list);
+	lk = cache_ext_lock();
+	if (!wnode || !wlist || !lk)
+		return -1;
+	bpf_spin_lock(lk);
+	cache_ext_bpf_list_add(wlist, wnode);
+	bpf_spin_unlock(lk);
+	return 0;
+}
+
+/* folio -> node, unlink from its list. Replaces bpf_cache_ext_list_del. */
+static __always_inline int
+cache_ext_list_del_bpf(mem_cgroup_per_node_bpf_writable *pn, struct folio *folio)
+{
+	struct cache_ext_list_node *node, *wnode;
+	struct bpf_spin_lock *lk;
+
+	if (!pn)
+		return -1;
+	node = cache_ext_bpf_valid_folios_lookup(pn, folio);
+	if (!node)
+		return -1;
+	wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
+	lk = cache_ext_lock();
+	if (!wnode || !lk)
+		return -1;
+	bpf_spin_lock(lk);
+	cache_ext_bpf_list_del(wnode);
+	bpf_spin_unlock(lk);
+	return 0;
+}
+
+/* folio -> node, move to head (tail=false) or tail (tail=true) of list_id.
+ * Replaces bpf_cache_ext_list_move. */
+static __always_inline int
+cache_ext_list_move_bpf(mem_cgroup_per_node_bpf_writable *pn,
+			struct folio *folio, __u64 list_id, bool tail)
+{
+	struct cache_ext_list_node *node, *wnode;
+	struct cache_ext_list *wlist;
+	struct bpf_spin_lock *lk;
+
+	if (!pn || !list_id)
+		return -1;
+	node = cache_ext_bpf_valid_folios_lookup(pn, folio);
+	if (!node)
+		return -1;
+	wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
+	wlist = cache_ext_writable_cast(list_id, struct cache_ext_list);
+	lk = cache_ext_lock();
+	if (!wnode || !wlist || !lk)
+		return -1;
+	bpf_spin_lock(lk);
+	cache_ext_bpf_list_del(wnode);
+	if (tail)
+		cache_ext_bpf_list_add_tail(wlist, wnode);
+	else
+		cache_ext_bpf_list_add(wlist, wnode);
+	bpf_spin_unlock(lk);
+	return 0;
+}
+
+/*
+ * Pure-BPF FIFO eviction: collect up to min(request, 32) folios from the head of
+ * list_id into ectx, oldest first. Walks the kernel list_head chain under the
+ * lock with bpf_probe_read_kernel (offsets: cache_ext_list.head@0,
+ * list_head.next@0, cache_ext_list_node.node@8, folio@0). Unrolled bound 32 so
+ * the ctx array index is a compile-time constant. Pure FIFO -- the kernel skips
+ * folios it cannot reclaim.
+ */
+#define CACHE_EXT_EVICT_MAX 32
+static __always_inline void
+cache_ext_evict_fifo(struct cache_ext_eviction_ctx *ectx, __u64 list_id)
+{
+	struct bpf_spin_lock *lk = cache_ext_lock();
+	__u64 head_addr = list_id, cur = 0;
+	unsigned long req, k = 0;
+	int i;
+
+	if (!list_id || !lk)
+		return;
+	req = ectx->request_nr_folios_to_evict;
+
+	bpf_spin_lock(lk);
+	bpf_probe_read_kernel(&cur, sizeof(cur), (void *)head_addr); /* head.next */
+	for (i = 0; i < CACHE_EXT_EVICT_MAX; i++) {
+		__u64 node_addr, folio = 0;
+
+		if (cur == 0 || cur == head_addr)
+			break;
+		if ((unsigned long)i >= req)
+			break;
+		node_addr = cur - 8; /* container_of(cur, cache_ext_list_node, node) */
+		bpf_probe_read_kernel(&folio, sizeof(folio), (void *)node_addr);
+		ectx->folios_to_evict[i] = (struct folio *)folio;
+		k++;
+		bpf_probe_read_kernel(&cur, sizeof(cur), (void *)cur); /* next */
+	}
+	ectx->nr_folios_to_evict = k;
+	bpf_spin_unlock(lk);
 }
 
 #endif /* _CACHE_EXT_DS_BPF_H */

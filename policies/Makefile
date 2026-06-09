@@ -45,7 +45,7 @@ $(VMLINUX_H):
 	sed -i '/^extern int bpf_stream_vprintk(/d' $(VMLINUX_H)
 
 .SECONDARY:
-%.bpf.o: %.bpf.c $(VMLINUX_H) dir_watcher.bpf.h
+%.bpf.o: %.bpf.c $(VMLINUX_H) dir_watcher.bpf.h cache_ext_lib.bpf.h cache_ext_ds.bpf.h
 	$(CLANG) $(CFLAGS) $(CLANG_BPF_SYS_INCLUDES) $< -o $@
 
 .SECONDARY:
