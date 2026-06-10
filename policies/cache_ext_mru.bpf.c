@@ -1,115 +1,78 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * MRU eviction policy -- PURE BPF data structures (M4).
+ *
+ * Most-recently-used: the list is ordered with the most recently touched folio
+ * at the head, and eviction takes from the head. The list is maintained entirely
+ * in BPF over the kernel-resident nodes:
+ *   folio_added    -> insert at head (new folio is the most recent)
+ *   folio_accessed -> move to head   (touched folio becomes the most recent)
+ *   folio_evicted  -> unlink (before the kernel frees the node)
+ *   evict_folios   -> hand the kernel the head folios (the most recently used)
+ * The only kfunc used is bpf_cache_ext_ds_registry_new_list (allocation); all
+ * list operations are the pure-BPF helpers in cache_ext_ds.bpf.h.
+ *
+ * folio_accessed receives the writable parent node (mem_cgroup_per_node) as a
+ * second arg (M4 kernel change), so the move can be done in BPF.
+ */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
 #include "cache_ext_lib.bpf.h"
+#include "cache_ext_ds.bpf.h"
 #include "dir_watcher.bpf.h"
 
 char _license[] SEC("license") = "GPL";
 
+static u64 mru_list;
 
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-
-// #define DEBUG
-#ifdef DEBUG
-#define dbg_printk(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
-#else
-#define dbg_printk(fmt, ...)
-#endif
-
-
-inline bool is_folio_relevant(struct folio *folio)
-{
-	if (!folio) {
+static inline bool is_folio_relevant(struct folio *folio) {
+	if (!folio || !folio->mapping || !folio->mapping->host)
 		return false;
-	}
-	if (folio->mapping == NULL) {
-		return false;
-	}
-	if (folio->mapping->host == NULL) {
-		return false;
-	}
-	bool res = inode_in_watchlist(folio->mapping->host->i_ino);
-	return res;
+
+	return inode_in_watchlist(folio->mapping->host->i_ino);
 }
-
-__u64 mru_list;
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(mru_init, struct mem_cgroup *memcg)
 {
-	dbg_printk("cache_ext: Hi from the mru_init hook! :D\n");
 	mru_list = bpf_cache_ext_ds_registry_new_list(memcg);
 	if (mru_list == 0) {
-		bpf_printk("cache_ext: Failed to create mru_list\n");
+		bpf_printk("cache_ext: mru init: Failed to create mru_list\n");
 		return -1;
 	}
-	bpf_printk("cache_ext: Created mru_list: %llu\n", mru_list);
 	return 0;
 }
 
-void BPF_STRUCT_OPS(mru_folio_added, struct folio *folio)
+void BPF_STRUCT_OPS(mru_folio_added, struct folio *folio,
+		    mem_cgroup_per_node_bpf_writable *pn)
 {
-	dbg_printk("cache_ext: Hi from the mru_folio_added hook! :D\n");
-	if (!is_folio_relevant(folio)) {
+	if (!is_folio_relevant(folio))
 		return;
-	}
 
-	int ret = bpf_cache_ext_list_add(mru_list, folio);
-	if (ret != 0) {
-		bpf_printk("cache_ext: Failed to add folio to mru_list\n");
-		return;
-	}
-	dbg_printk("cache_ext: Added folio to mru_list\n");
+	cache_ext_list_add_bpf(pn, folio, mru_list);
 }
 
-void BPF_STRUCT_OPS(mru_folio_accessed, struct folio *folio)
+void BPF_STRUCT_OPS(mru_folio_accessed, struct folio *folio,
+		    mem_cgroup_per_node_bpf_writable *pn)
 {
-	int ret;
-	dbg_printk("cache_ext: Hi from the mru_folio_accessed hook! :D\n");
-
-	if (!is_folio_relevant(folio)) {
+	if (!is_folio_relevant(folio))
 		return;
-	}
 
-	ret = bpf_cache_ext_list_move(mru_list, folio, false);
-	if (ret != 0) {
-		bpf_printk("cache_ext: Failed to move folio to mru_list head\n");
-		return;
-	}
-
-	dbg_printk("cache_ext: Moved folio to mru_list tail\n");
+	cache_ext_list_move_bpf(pn, folio, mru_list, false);
 }
 
-void BPF_STRUCT_OPS(mru_folio_evicted, struct folio *folio)
+void BPF_STRUCT_OPS(mru_folio_evicted, struct folio *folio,
+		    mem_cgroup_per_node_bpf_writable *pn)
 {
-	dbg_printk("cache_ext: Hi from the mru_folio_evicted hook! :D\n");
-	bpf_cache_ext_list_del(folio);
-}
-
-static int iterate_mru(int idx, struct cache_ext_list_node *node)
-{
-	if ((idx < 200) && (!folio_test_uptodate(node->folio) || !folio_test_lru(node->folio))) {
-		return CACHE_EXT_CONTINUE_ITER;
-	}
-	return CACHE_EXT_EVICT_NODE;
+	cache_ext_list_del_bpf(pn, folio);
 }
 
 void BPF_STRUCT_OPS(mru_evict_folios, struct cache_ext_eviction_ctx *eviction_ctx,
-	       struct mem_cgroup *memcg)
+		    struct mem_cgroup *memcg)
 {
-	dbg_printk("cache_ext: Hi from the mru_evict_folios hook! :D\n");
-	int ret = bpf_cache_ext_list_iterate(memcg, mru_list, iterate_mru,
-					     eviction_ctx);
-	// Check that the right amount of folios were evicted
-	if (ret < 0) {
-		bpf_printk("cache_ext: Failed to evict folios\n");
-	}
-	if (eviction_ctx->request_nr_folios_to_evict > eviction_ctx->nr_folios_to_evict) {
-		bpf_printk("cache_ext: Didn't evict enough folios. Requested: %d, Evicted: %d\n",
-			   eviction_ctx->request_nr_folios_to_evict,
-			   eviction_ctx->nr_folios_to_evict);
-	}
+	cache_ext_evict_fifo(eviction_ctx, mru_list);
 }
 
 SEC(".struct_ops.link")
