@@ -26,18 +26,18 @@ download_and_extract() {
 		echo "  https://github.com/cache-ext/cache_ext"
 		exit 1
 	fi
-	echo "Extracting ${name}.tar.zst..."
-	tar --use-compress-program=zstd -xf "${name}.tar.zst"
-	rm "${name}.tar.zst"
+	#echo "Extracting ${name}.tar.zst..."
+	#tar --use-compress-program=zstd -xf "${name}.tar.zst"
+	#rm "${name}.tar.zst"
 }
 
 echo "Downloading LevelDB database..."
-download_and_extract "leveldb"
+download_and_extract "leveldb" &
 
 echo "Downloading Twitter trace metadata..."
-download_and_extract "twitter-traces"
+download_and_extract "twitter-traces" &
 
 for cluster in 17 18 24 34 52; do
 	echo "Downloading LevelDB Twitter cluster $cluster database..."
-	download_and_extract "leveldb_twitter_cluster${cluster}_db"
+	download_and_extract "leveldb_twitter_cluster${cluster}_db" &
 done

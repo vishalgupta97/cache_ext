@@ -9,13 +9,14 @@
  * non-evictable folios get INT64_MAX), and for each group of sample_size folios
  * evict the lowest-scoring one.
  *
- * The walk is a racy bpf_loop walk over raw addresses (bpf_probe_read_kernel) --
- * NOT under the bpf_spin_lock, because bpf_loop is not allowed inside a
- * spin-lock CS. Safety: a folio that has been (or is being) evicted has its
- * metadata deleted FIRST in folio_evicted, and its node unlinked, so the walk
- * only reaches live folios; any stale/freed node has no metadata and scores
- * INT64_MAX, so it is never offered to the kernel. evict_folios is only invoked
- * under real LRU reclaim (MGLRU off, working-set workload), not streaming reads.
+ * The walk is a bpf_loop over raw addresses (bpf_probe_read_kernel) held UNDER
+ * the shared registry bpf_spin_lock -- the same lock the kernel takes in
+ * valid_folios_del -- so a node cannot be freed mid-walk (no use-after-free).
+ * bpf_loop with a non-sleepable callback is permitted inside the critical
+ * section on this kernel (spin-lock timeout + undo-logging make the long-held
+ * lock safe). A captured folio may still become non-reclaimable by the time the
+ * kernel processes it; that is harmless -- the kernel skips folios it cannot
+ * reclaim and we never offer a NULL folio.
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -69,6 +70,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(sampling_init, struct mem_cgroup *memcg)
 	sampling_list = bpf_cache_ext_ds_registry_new_list(memcg);
 	if (sampling_list == 0)
 		return -1;
+	cache_ext_ds_init_lock(memcg);
 	return 0;
 }
 
@@ -185,17 +187,22 @@ void BPF_STRUCT_OPS(sampling_evict_folios,
 	unsigned long out = 0;
 	int g;
 
-	if (!sampling_list)
+	if (!sampling_list || !cache_ext_reg_lock_addr)
 		return;
 	if (req > EVICT_MAX)
 		req = EVICT_MAX;
 	num = req * SAMPLE_SIZE;
 
 	c.head = sampling_list; /* &list->head (head @ offset 0) */
-	if (bpf_probe_read_kernel(&c.cur, sizeof(c.cur), (void *)c.head))
-		return;
 
-	bpf_loop(num, sample_walk_cb, &c, 0);
+	/* Walk under the SHARED registry lock (the same one the kernel takes in
+	 * valid_folios_del), so a node cannot be freed mid-walk. bpf_loop with a
+	 * callback doing only non-sleepable helpers (map lookup, probe_read) is
+	 * permitted inside the critical section on this kernel. */
+	bpf_spin_lock(cache_ext_lock_cast());
+	if (!bpf_probe_read_kernel(&c.cur, sizeof(c.cur), (void *)c.head))
+		bpf_loop(num, sample_walk_cb, &c, 0);
+	bpf_spin_unlock(cache_ext_lock_cast());
 
 	/* Groups populate 0,1,2,... in order, so the populated groups are exactly
 	 * [0, num_groups) -- contiguous, no gaps. Emit each group's min at its

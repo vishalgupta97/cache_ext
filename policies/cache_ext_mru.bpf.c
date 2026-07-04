@@ -42,6 +42,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mru_init, struct mem_cgroup *memcg)
 		bpf_printk("cache_ext: mru init: Failed to create mru_list\n");
 		return -1;
 	}
+	cache_ext_ds_init_lock(memcg);
 	return 0;
 }
 

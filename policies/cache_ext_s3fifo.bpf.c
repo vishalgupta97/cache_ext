@@ -177,6 +177,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(s3fifo_init, struct mem_cgroup *memcg)
 		return -1;
 	}
 
+	cache_ext_ds_init_lock(memcg);
 	return 0;
 }
 
@@ -335,17 +336,21 @@ static int s3_iter_cb(__u32 i, void *vctx)
  */
 static __always_inline void s3_iterate_pass(struct s3_iter_ctx *c)
 {
-	struct bpf_spin_lock *lk = cache_ext_lock();
 	__u64 first = 0;
 
-	if (!c->head || c->full || !lk)
+	if (!c->head || c->full || !cache_ext_reg_lock_addr)
 		return;
 
-	bpf_spin_lock(lk);
+	/* Hold the SHARED registry lock across the whole bpf_loop walk -- the same
+	 * lock the kernel takes in valid_folios_del, so a node cannot be freed
+	 * mid-walk. The lock pointer is re-derived for the unlock rather than held
+	 * in a local across the loop (a writable-cast pointer can lose its type
+	 * across the bpf_loop call). */
+	bpf_spin_lock(cache_ext_lock_cast());
 	bpf_probe_read_kernel(&first, sizeof(first), (void *)c->head); /* head.next */
 	c->cur = first;
 	bpf_loop(S3_MAX_ITER, s3_iter_cb, c, 0);
-	bpf_spin_unlock(lk);
+	bpf_spin_unlock(cache_ext_lock_cast());
 }
 
 static __always_inline void

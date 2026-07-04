@@ -35,6 +35,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fifo_init, struct mem_cgroup *memcg)
 		bpf_printk("cache_ext: fifo init: Failed to create main_list\n");
 		return -1;
 	}
+	cache_ext_ds_init_lock(memcg);
 	return 0;
 }
 
