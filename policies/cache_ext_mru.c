@@ -1,7 +1,9 @@
 #include <argp.h>
 #include <bpf/bpf.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -22,6 +24,13 @@ static struct argp_option options[] = { { "watch_dir", 'w', "DIR", 0,
 					{ "cgroup_path", 'c', "PATH", 0,
 					  "Path to cgroup (e.g., /sys/fs/cgroup/cache_ext_test)" },
 					{ 0 } };
+
+static volatile sig_atomic_t exiting;
+
+static void sig_handler(int signo)
+{
+	exiting = 1;
+}
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state)
 {
@@ -45,6 +54,7 @@ int main(int argc, char **argv)
 	struct cache_ext_mru_bpf *skel = NULL;
 	struct bpf_link *link = NULL;
 	int cgroup_fd = -1;
+	struct sigaction sa;
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
 	// Parse command line arguments
@@ -60,6 +70,15 @@ int main(int argc, char **argv)
 
 	if (args.cgroup_path == NULL) {
 		fprintf(stderr, "Missing required argument: cgroup_path\n");
+		return 1;
+	}
+
+	memset(&sa, 0, sizeof(sa));
+	sigemptyset(&sa.sa_mask);
+	sa.sa_handler = sig_handler;
+
+	if (sigaction(SIGINT, &sa, NULL)) {
+		perror("Failed to set up signal handling");
 		return 1;
 	}
 
@@ -118,9 +137,9 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	// Wait for keyboard input
-	printf("Press any key to exit...\n");
-	getchar();
+	printf("Attached. Press Ctrl-C to exit...\n");
+	while (!exiting)
+		sleep(1);
 	ret = 0;
 
 cleanup:

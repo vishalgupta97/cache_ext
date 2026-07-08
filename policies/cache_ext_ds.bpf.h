@@ -173,6 +173,14 @@ cache_ext_bpf_list_add(struct cache_ext_list *list,
 	head->next = new;
 }
 
+static __always_inline bool
+cache_ext_bpf_list_node_empty(struct cache_ext_list_node *node)
+{
+	struct list_head *n = &node->node;
+
+	return n->next == n;
+}
+
 /*
  * Standard list_del_init: unlink node from its list and re-init its links to
  * itself (so a subsequent add works and a double-del is harmless).
@@ -293,6 +301,7 @@ cache_ext_list_add_tail_bpf(mem_cgroup_per_node_bpf_writable *pn,
 {
 	struct cache_ext_list_node *node, *wnode;
 	struct cache_ext_list *wlist;
+	int ret = 0;
 
 	if (!pn || !list_id || !cache_ext_reg_lock_addr)
 		return -1;
@@ -301,11 +310,15 @@ cache_ext_list_add_tail_bpf(mem_cgroup_per_node_bpf_writable *pn,
 	if (node) {
 		wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
 		wlist = cache_ext_writable_cast(list_id, struct cache_ext_list);
-		if (wnode && wlist)
+		if (wnode && wlist && cache_ext_bpf_list_node_empty(wnode))
 			cache_ext_bpf_list_add_tail(wlist, wnode);
+		else
+			ret = -1;
+	} else {
+		ret = -1;
 	}
 	bpf_spin_unlock(cache_ext_lock_cast());
-	return 0;
+	return ret;
 }
 
 /* folio -> node, insert at head of list_id. Replaces bpf_cache_ext_list_add. */
@@ -315,6 +328,7 @@ cache_ext_list_add_bpf(mem_cgroup_per_node_bpf_writable *pn,
 {
 	struct cache_ext_list_node *node, *wnode;
 	struct cache_ext_list *wlist;
+	int ret = 0;
 
 	if (!pn || !list_id || !cache_ext_reg_lock_addr)
 		return -1;
@@ -323,11 +337,15 @@ cache_ext_list_add_bpf(mem_cgroup_per_node_bpf_writable *pn,
 	if (node) {
 		wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
 		wlist = cache_ext_writable_cast(list_id, struct cache_ext_list);
-		if (wnode && wlist)
+		if (wnode && wlist && cache_ext_bpf_list_node_empty(wnode))
 			cache_ext_bpf_list_add(wlist, wnode);
+		else
+			ret = -1;
+	} else {
+		ret = -1;
 	}
 	bpf_spin_unlock(cache_ext_lock_cast());
-	return 0;
+	return ret;
 }
 
 /* folio -> node, unlink from its list. Replaces bpf_cache_ext_list_del. */
@@ -335,6 +353,7 @@ static __always_inline int
 cache_ext_list_del_bpf(mem_cgroup_per_node_bpf_writable *pn, struct folio *folio)
 {
 	struct cache_ext_list_node *node, *wnode;
+	int ret = 0;
 
 	if (!pn || !cache_ext_reg_lock_addr)
 		return -1;
@@ -342,11 +361,15 @@ cache_ext_list_del_bpf(mem_cgroup_per_node_bpf_writable *pn, struct folio *folio
 	node = cache_ext_bpf_valid_folios_lookup(pn, folio);
 	if (node) {
 		wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
-		if (wnode)
+		if (wnode && !cache_ext_bpf_list_node_empty(wnode))
 			cache_ext_bpf_list_del(wnode);
+		else
+			ret = -1;
+	} else {
+		ret = -1;
 	}
 	bpf_spin_unlock(cache_ext_lock_cast());
-	return 0;
+	return ret;
 }
 
 /* folio -> node, move to head (tail=false) or tail (tail=true) of list_id.
@@ -357,6 +380,7 @@ cache_ext_list_move_bpf(mem_cgroup_per_node_bpf_writable *pn,
 {
 	struct cache_ext_list_node *node, *wnode;
 	struct cache_ext_list *wlist;
+	int ret = 0;
 
 	if (!pn || !list_id || !cache_ext_reg_lock_addr)
 		return -1;
@@ -365,16 +389,19 @@ cache_ext_list_move_bpf(mem_cgroup_per_node_bpf_writable *pn,
 	if (node) {
 		wnode = cache_ext_writable_cast((__u64)node, struct cache_ext_list_node);
 		wlist = cache_ext_writable_cast(list_id, struct cache_ext_list);
-		if (wnode && wlist) {
+		if (wnode && wlist && !cache_ext_bpf_list_node_empty(wnode)) {
 			cache_ext_bpf_list_del(wnode);
 			if (tail)
 				cache_ext_bpf_list_add_tail(wlist, wnode);
 			else
 				cache_ext_bpf_list_add(wlist, wnode);
-		}
+		} else
+			ret = -1;
+	} else {
+		ret = -1;
 	}
 	bpf_spin_unlock(cache_ext_lock_cast());
-	return 0;
+	return ret;
 }
 
 /*

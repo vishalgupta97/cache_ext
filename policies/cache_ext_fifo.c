@@ -154,9 +154,9 @@ int main(int argc, char **argv) {
 		goto cleanup;
 	}
 
-	// Wait for keyboard input
-	printf("Press any key to exit...\n");
-	getchar();
+	printf("Attached. Press Ctrl-C to exit...\n");
+	while (!exiting)
+		sleep(1);
 	ret = 0;
 
 cleanup:

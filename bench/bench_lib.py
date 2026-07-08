@@ -38,7 +38,6 @@ class CacheExtPolicy:
         if self.has_started:
             raise Exception("Policy already started")
 
-        self.has_started = True
         cmd = [
             "sudo",
             self.loader_path,
@@ -61,16 +60,20 @@ class CacheExtPolicy:
         # This is a workaround to fix it.
         # run(["stty", "sane"])
         if self._policy_thread.poll() is not None:
+            out, err = self._policy_thread.communicate()
+            self._policy_thread = None
             raise Exception(
-                "Policy thread exited unexpectedly: %s"
-                % self._policy_thread.stderr.read().decode("utf-8")
+                "Policy thread exited unexpectedly:\nstdout: %s\nstderr: %s"
+                % (out.decode("utf-8"), err.decode("utf-8"))
             )
+        self.has_started = True
 
     def stop(self):
         if not self.has_started:
             raise Exception("Policy not started")
-        cmd = ["sudo", "kill", "-2", str(self._policy_thread.pid)]
-        run(cmd)
+        if self._policy_thread.poll() is None:
+            cmd = ["sudo", "kill", "-2", str(self._policy_thread.pid)]
+            run(cmd)
         out, err = self._policy_thread.communicate()
         with suppress(subprocess.CalledProcessError):
             run(["sudo", "rm", "/sys/fs/bpf/cache_ext/scan_pids"])
@@ -277,11 +280,17 @@ def disable_swap():
 
 
 def disable_smt():
-    run(["sudo", "sh", "-c", "echo off > /sys/devices/system/cpu/smt/control"])
+    try:
+        run(["sudo", "sh", "-c", "echo off > /sys/devices/system/cpu/smt/control"])
+    except CalledProcessError as e:
+        log.warning("Failed to disable SMT, continuing: %s", e)
 
 
 def enable_smt():
-    run(["sudo", "sh", "-c", "echo on > /sys/devices/system/cpu/smt/control"])
+    try:
+        run(["sudo", "sh", "-c", "echo on > /sys/devices/system/cpu/smt/control"])
+    except CalledProcessError as e:
+        log.warning("Failed to enable SMT, continuing: %s", e)
 
 
 def rsync_folder(source_dir: str, dest_dir: str):

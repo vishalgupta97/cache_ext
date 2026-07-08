@@ -17,7 +17,7 @@ def reset_database(db_dir: str, temp_db_dir: str):
     # rsync -avpl --delete /mydata/leveldb_db_orig/ /mydata/leveldb_db/
     if not db_dir.endswith("/"):
         db_dir += "/"
-    run(["rsync", "-avpl", "--delete", db_dir, temp_db_dir])
+    run(["rsync", "-apl", "--delete", "--info=stats2", "--human-readable", db_dir, temp_db_dir])
 
 
 def parse_leveldb_bench_results(stdout: str) -> Dict:
@@ -113,7 +113,11 @@ class LevelDBBenchmark(BenchmarkFramework):
         self.cache_ext_policy = CacheExtPolicy(
             DEFAULT_CACHE_EXT_CGROUP, self.args.policy_loader, self.args.leveldb_temp_db
         )
-        CLEANUP_TASKS.append(lambda: self.cache_ext_policy.stop())
+        CLEANUP_TASKS.append(
+            lambda: self.cache_ext_policy.stop()
+            if self.cache_ext_policy.has_started
+            else None
+        )
 
     def add_arguments(self, parser: argparse.ArgumentParser):
         parser.add_argument(
@@ -152,11 +156,31 @@ class LevelDBBenchmark(BenchmarkFramework):
             default="",
             help="Specify the fadvise hints to use for the baseline cgroup, e.g., ',SEQUENTIAL,NOREUSE,DONTNEED'",
         )
+        parser.add_argument(
+            "--runtime-seconds",
+            type=int,
+            default=240,
+            help="Runtime in seconds for each LevelDB workload",
+        )
+        parser.add_argument(
+            "--warmup-runtime-seconds",
+            type=int,
+            default=45,
+            help="Warmup runtime in seconds for each LevelDB workload",
+        )
+        parser.add_argument(
+            "--cache-ext-only",
+            action="store_true",
+            default=False,
+            help="Run only the cache_ext cgroup config",
+        )
 
     def generate_configs(self, configs: List[Dict]) -> List[Dict]:
         configs = add_config_option("enable_mmap", [False], configs)
-        configs = add_config_option("runtime_seconds", [240], configs)
-        configs = add_config_option("warmup_runtime_seconds", [45], configs)
+        configs = add_config_option("runtime_seconds", [self.args.runtime_seconds], configs)
+        configs = add_config_option(
+            "warmup_runtime_seconds", [self.args.warmup_runtime_seconds], configs
+        )
         configs = add_config_option(
             "benchmark", parse_strings_string(self.args.benchmark), configs
         )
@@ -164,6 +188,10 @@ class LevelDBBenchmark(BenchmarkFramework):
         if self.args.default_only:
             configs = add_config_option(
                 "cgroup_name", [DEFAULT_BASELINE_CGROUP], configs
+            )
+        elif self.args.cache_ext_only:
+            configs = add_config_option(
+                "cgroup_name", [DEFAULT_CACHE_EXT_CGROUP], configs
             )
         else:
             configs = add_config_option(
