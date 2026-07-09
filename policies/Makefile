@@ -3,7 +3,12 @@
 CLANG ?= clang-14
 BPFTOOL ?= /usr/local/sbin/bpftool #../../tools/bpf/bpftool/bpftool
 CFLAGS = -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -c -g -Wall
-USERSPACE_CFLAGS = -O2 -fsanitize=address -g -Wall -I/usr/local/include
+USERSPACE_SANITIZE ?= 0
+USERSPACE_SANITIZE_FLAGS =
+ifeq ($(USERSPACE_SANITIZE),1)
+USERSPACE_SANITIZE_FLAGS = -fsanitize=address
+endif
+USERSPACE_CFLAGS = -O2 -g -Wall -I/usr/local/include $(USERSPACE_SANITIZE_FLAGS)
 USERSPACE_LINKER_FLAGS = -L/usr/local/lib64 -lbpf -Wl,-rpath,/usr/local/lib64
 
 # Define the BPF program source and the output object file

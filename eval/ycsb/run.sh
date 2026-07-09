@@ -17,8 +17,10 @@ DB_PATH=${DB_PATH:-/home/vishal/ebpf/cache_ext_dbs/leveldb}
 RESULTS_PATH="$BASE_DIR/results"
 
 ITERATIONS=${ITERATIONS:-1}
-WARMUP_SECONDS=${WARMUP_SECONDS:-30}
-RUNTIME_SECONDS=${RUNTIME_SECONDS:-30}
+WARMUP_SECONDS=${WARMUP_SECONDS:-45}
+RUNTIME_SECONDS=${RUNTIME_SECONDS:-240}
+BENCHMARKS=${BENCHMARKS:-ycsb_a,ycsb_b,ycsb_c,ycsb_d,ycsb_e,ycsb_f}
+RESULTS_FILE=${RESULTS_FILE:-$RESULTS_PATH/ycsb_d_ported_policies_240s.json}
 CPU_COUNT=${CPU_COUNT:-8}
 EXPECTED_ACTIVE_THREADS=${EXPECTED_ACTIVE_THREADS:-8}
 CPU_MONITOR_GRACE_SECONDS=${CPU_MONITOR_GRACE_SECONDS:-20}
@@ -59,6 +61,7 @@ fi
 monitor_cpu() {
 	local policy="$1"
 	local log_file="$2"
+	local done_file="${3:-}"
 	local max_cpu=0
 	local max_active_threads=0
 	local met_expected_threads=0
@@ -78,6 +81,10 @@ monitor_cpu() {
 		if [[ -z "$pid" ]]; then
 			if [[ "$saw_process" == 1 ]]; then
 				break
+			fi
+			if [[ -n "$done_file" && -f "$done_file" ]]; then
+				echo "# no run_leveldb observed before benchmark command completed" >> "$log_file"
+				return 0
 			fi
 			sleep 1
 			continue
@@ -152,29 +159,33 @@ fi
 for POLICY in "${POLICIES[@]}"; do
 	echo "Running policy: ${POLICY}"
 	CPU_LOG="$RESULTS_PATH/ycsb_d_${POLICY}_cpu.log"
-	monitor_cpu "$POLICY" "$CPU_LOG" &
+	CPU_DONE="$RESULTS_PATH/.${POLICY}.cpu_done.$$"
+	rm -f "$CPU_DONE"
+	monitor_cpu "$POLICY" "$CPU_LOG" "$CPU_DONE" &
 	MONITOR_PID=$!
 
 	set +e
 	python3 "$BENCH_PATH/bench_leveldb.py" \
 		--cpu "$CPU_COUNT" \
 		--policy-loader "$POLICY_PATH/${POLICY}.out" \
-		--results-file "$RESULTS_PATH/ycsb_d_ported_policies_30s.json" \
+		--results-file "$RESULTS_FILE" \
 		--leveldb-db "$DB_PATH" \
 		--fadvise-hints "" \
 		--iterations "$ITERATIONS" \
 		--bench-binary-dir "$YCSB_PATH/build" \
-		--benchmark ycsb_d \
+		--benchmark "$BENCHMARKS" \
 		--runtime-seconds "$RUNTIME_SECONDS" \
 		--warmup-runtime-seconds "$WARMUP_SECONDS" \
 		--cache-ext-only \
 		"${BENCH_EXTRA_ARGS[@]}"
 	BENCH_RC=$?
+	touch "$CPU_DONE"
 	if (( BENCH_RC != 0 )); then
 		kill "$MONITOR_PID" 2>/dev/null || true
 	fi
 	wait "$MONITOR_PID"
 	MONITOR_RC=$?
+	rm -f "$CPU_DONE"
 	set -e
 
 	if (( BENCH_RC != 0 )); then
